@@ -1,0 +1,27 @@
+{
+  "entities": {
+    "PortfolioItem": {
+      "title": "Portfolio Segment",
+      "description": "Represents a section of the user's portfolio data",
+      "type": "object",
+      "properties": {
+        "data": {
+          "type": "object",
+          "description": "The dynamic list or settings object for this portfolio section"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when this section was last updated"
+        }
+      },
+      "required": ["data"]
+    }
+  },
+  "firestore": {
+    "/portfolio_data/{sectionId}": {
+      "schema": "PortfolioItem",
+      "description": "Store each segment of the portfolio: projects, skills, experiences, educations, messages, and settings"
+    }
+  }
+}
