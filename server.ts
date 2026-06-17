@@ -76,14 +76,22 @@ let dbInstance: any = null;
 async function getFirebaseDB() {
   if (dbInstance) return dbInstance;
   try {
-    const CONFIG_FILE = path.join(process.cwd(), "firebase-applet-config.json");
-    const exists = await fs.access(CONFIG_FILE).then(() => true).catch(() => false);
-    if (!exists) {
-      console.warn("firebase-applet-config.json not found! Falling back to local state.");
-      return null;
+    let firebaseConfig;
+    try {
+      // Direct require allows esbuild to bundle the JSON, making it available on Vercel
+      firebaseConfig = require("./firebase-applet-config.json");
+    } catch (e) {
+      // Fallback if not found
+      const CONFIG_FILE = path.join(process.cwd(), "firebase-applet-config.json");
+      const exists = await fs.access(CONFIG_FILE).then(() => true).catch(() => false);
+      if (!exists) {
+        console.warn("firebase-applet-config.json not found! Falling back to local state.");
+        return null;
+      }
+      const configContent = await fs.readFile(CONFIG_FILE, "utf-8");
+      firebaseConfig = JSON.parse(configContent);
     }
-    const configContent = await fs.readFile(CONFIG_FILE, "utf-8");
-    const firebaseConfig = JSON.parse(configContent);
+    
     const app = initializeApp(firebaseConfig);
     const dbId = firebaseConfig.firestoreDatabaseId;
     dbInstance = dbId ? getFirestore(app, dbId) : getFirestore(app);
