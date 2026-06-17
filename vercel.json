@@ -1,19 +1,13 @@
 {
   "version": 2,
-  "buildCommand": "npm run build",
-  "builds": [
-    {
-      "src": "dist/server.cjs",
-      "use": "@vercel/node",
-      "config": {
-        "maxLambdaSize": "50mb"
-      }
+  "buildCommand": "vite build",
+  "functions": {
+    "server.ts": {
+      "memory": 1024,
+      "maxDuration": 30
     }
-  ],
-  "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "/dist/server.cjs"
-    }
+  },
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/server.ts" }
   ]
 }

@@ -238,211 +238,176 @@ async function initDB(): Promise<PortfolioDB> {
   }
 }
 
-async function startServer() {
-  const app = express();
+// ============================================================
+// Express App — module-level setup for Vercel serverless support
+// ============================================================
+const app = express();
 
-  // Support large Base64 project/profile images uploaded via Admin Interface
-  app.use(express.json({ limit: "150mb" }));
-  app.use(express.urlencoded({ limit: "150mb", extended: true }));
+// Support large Base64 images uploaded via Admin Interface
+app.use(express.json({ limit: "150mb" }));
+app.use(express.urlencoded({ limit: "150mb", extended: true }));
 
-  // API Endpoints for dynamic content fetching & management
-
-  // 1. Get entire portfolio state
-  app.get("/api/portfolio", async (req, res) => {
-    try {
-      const db = await initDB();
-      res.json(db);
-    } catch (error) {
-      console.error("Failed to read portfolio data:", error);
-      res.status(500).json({ error: "Failed to read portfolio data" });
+// Helper to dynamically serve index.html with injected DB data
+const serveHTMLWithInjectedDB = async (req: express.Request, res: express.Response, viteInstance?: any) => {
+  try {
+    const db = await initDB();
+    const dataScript = `<script>window.__INITIAL_DATA__ = ${JSON.stringify(db).replace(/</g, '\\u003c')};</script>`;
+    let html = "";
+    if (viteInstance) {
+      const templatePath = path.join(process.cwd(), "index.html");
+      let rawHtml = await fs.readFile(templatePath, "utf-8");
+      rawHtml = await viteInstance.transformIndexHtml(req.originalUrl, rawHtml);
+      html = rawHtml.replace("</head>", `${dataScript}</head>`);
+    } else {
+      const templatePath = path.join(process.cwd(), "dist", "index.html");
+      const rawHtml = await fs.readFile(templatePath, "utf-8");
+      html = rawHtml.replace("</head>", `${dataScript}</head>`);
     }
-  });
-
-  // 2. Update specific table or section of the database
-  app.post("/api/portfolio/update", async (req, res) => {
-    try {
-      const { key, data } = req.body;
-      const validKeys = ["projects", "skills", "experiences", "educations", "messages", "settings", "certificates"];
-      
-      if (!key || !validKeys.includes(key)) {
-        return res.status(400).json({ error: "Invalid collection key" });
-      }
-
-      const timestamp = new Date().toISOString();
-
-      // Save to Firestore — this is the ONLY persistent storage (especially on Vercel)
-      const firestoreDB = await getFirebaseDB();
-      let firebaseSynced = false;
-      if (firestoreDB) {
-        try {
-          await setDoc(doc(firestoreDB, "portfolio_data", key), {
-            data: data,
-            updatedAt: timestamp
-          });
-          firebaseSynced = true;
-          console.log(`[${key}] persisted to Firestore at ${timestamp}`);
-        } catch (err) {
-          console.error(`Failed to write [${key}] to Firestore:`, err);
-          // Return error so the client knows the save failed
-          return res.status(500).json({ error: `Failed to save [${key}] to database` });
-        }
-      } else {
-        console.warn("Firestore unavailable — data will NOT be persisted permanently!");
-      }
-
-      // In local dev: also update the local JSON cache for offline use
-      if (!IS_VERCEL) {
-        try {
-          let cached: PortfolioDB;
-          try {
-            const fileExists = await fs.access(DB_FILE).then(() => true).catch(() => false);
-            if (fileExists) {
-              const content = await fs.readFile(DB_FILE, "utf-8");
-              cached = JSON.parse(content);
-            } else {
-              cached = await initDB();
-            }
-          } catch {
-            cached = await initDB();
-          }
-
-          // Email notification for new messages (local dev only)
-          if (key === "messages") {
-            const oldMessages = cached.messages || [];
-            const newMessages = data || [];
-            if (newMessages.length > oldMessages.length && newMessages.length > 0) {
-              const newMsg = newMessages[0];
-              const settings = cached.settings || {};
-              if (settings.enableEmailNotify) {
-                console.log(`Dispatched SMTP notification for message from ${newMsg.sender}`);
-                sendEmailNotification(newMsg, settings).catch(err => {
-                  console.error("Failed to dispatch email notification:", err);
-                });
-              }
-            }
-          }
-
-          cached[key as keyof PortfolioDB] = data;
-          await atomicWriteFile(DB_FILE, JSON.stringify(cached, null, 2));
-        } catch (cacheErr) {
-          console.warn("Local cache update failed (non-critical):", cacheErr);
-        }
-      }
-
-      console.log(`[${key}] update complete. Firestore synced: ${firebaseSynced}`);
-      res.json({ success: true, firebaseSynced });
-    } catch (error) {
-      console.error("Failed to update portfolio data:", error);
-      res.status(500).json({ error: "Failed to update portfolio data" });
+    res.status(200).set({ "Content-Type": "text/html" }).end(html);
+  } catch (err) {
+    console.error("HTML Injection failed:", err);
+    if (viteInstance) {
+      res.status(500).send("Server Error");
+    } else {
+      res.sendFile(path.join(process.cwd(), "dist", "index.html"));
     }
-  });
-
-  // 3. Reset entire database back to default initial values
-  app.post("/api/portfolio/reset", async (req, res) => {
-    try {
-      const defaultDB: PortfolioDB = {
-        projects: INITIAL_PROJECTS,
-        skills: INITIAL_SKILLS,
-        experiences: INITIAL_EXPERIENCES,
-        educations: INITIAL_EDUCATIONS,
-        messages: INITIAL_MESSAGES,
-        settings: INITIAL_SETTINGS,
-        certificates: INITIAL_CERTIFICATES
-      };
-
-      // Reset in cloud Firestore first
-      const db = await getFirebaseDB();
-      if (db) {
-        await Promise.all(
-          Object.entries(defaultDB).map(async ([key, val]) => {
-            try {
-              await setDoc(doc(db, "portfolio_data", key), {
-                data: val,
-                updatedAt: new Date().toISOString()
-              });
-            } catch (err) {
-              console.error(`Failed to reset [${key}] in Firestore:`, err);
-            }
-          })
-        );
-        console.log("Firestore database successfully reset back to defaults.");
-      }
-
-      await atomicWriteFile(DB_FILE, JSON.stringify(defaultDB, null, 2));
-      console.log("Database reset to defaults.");
-      res.json({ success: true, db: defaultDB });
-    } catch (error) {
-      console.error("Failed to reset portfolio database:", error);
-      res.status(500).json({ error: "Failed to reset portfolio database" });
-    }
-  });
-
-  // Helper to dynamically read index.html, inject our database, and send it.
-  // This completely eliminates any 2-second "data loading" gap or flicker of initial layout!
-  const serveHTMLWithInjectedDB = async (req: express.Request, res: express.Response, viteInstance?: any) => {
-    try {
-      const db = await initDB();
-      // Safe script tag encoding (escapes closing tags and keeps keys secure)
-      const dataScript = `<script>window.__INITIAL_DATA__ = ${JSON.stringify(db).replace(/</g, '\\u003c')};</script>`;
-
-      let html = "";
-      if (viteInstance) {
-        // Dev: read template and compile with Vite
-        const templatePath = path.join(process.cwd(), "index.html");
-        let rawHtml = await fs.readFile(templatePath, "utf-8");
-        rawHtml = await viteInstance.transformIndexHtml(req.originalUrl, rawHtml);
-        html = rawHtml.replace("</head>", `${dataScript}</head>`);
-      } else {
-        // Production: read compiled template from dist
-        const templatePath = path.join(process.cwd(), "dist", "index.html");
-        const rawHtml = await fs.readFile(templatePath, "utf-8");
-        html = rawHtml.replace("</head>", `${dataScript}</head>`);
-      }
-      
-      res.status(200).set({ "Content-Type": "text/html" }).end(html);
-    } catch (err) {
-      console.error("HTML Injection failed, falling back to static file layout:", err);
-      if (viteInstance) {
-        // fallback to standard vite middleware behavior
-        res.status(500).send("Server Error");
-      } else {
-        res.sendFile(path.join(process.cwd(), "dist", "index.html"));
-      }
-    }
-  };
-
-  // Integrate Vite for hot reloads and asset compilation
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    
-    // Catch root HTML requests before Vite middleware to inject the DB instantly
-    app.get("/", async (req, res) => {
-      await serveHTMLWithInjectedDB(req, res, vite);
-    });
-    app.get("/index.html", async (req, res) => {
-      await serveHTMLWithInjectedDB(req, res, vite);
-    });
-
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), "dist");
-    // Serve static files first but exclude index.html matching so we can dynamically inject DB
-    app.use(express.static(distPath, { index: false }));
-    
-    app.get("*", async (req, res) => {
-      await serveHTMLWithInjectedDB(req, res);
-    });
   }
+};
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running at http://localhost:${PORT}`);
+// 1. GET entire portfolio state
+app.get("/api/portfolio", async (req: express.Request, res: express.Response) => {
+  try {
+    const db = await initDB();
+    res.json(db);
+  } catch (error) {
+    console.error("Failed to read portfolio data:", error);
+    res.status(500).json({ error: "Failed to read portfolio data" });
+  }
+});
+
+// 2. Update a specific section of the database
+app.post("/api/portfolio/update", async (req: express.Request, res: express.Response) => {
+  try {
+    const { key, data } = req.body;
+    const validKeys = ["projects", "skills", "experiences", "educations", "messages", "settings", "certificates"];
+    if (!key || !validKeys.includes(key)) {
+      return res.status(400).json({ error: "Invalid collection key" });
+    }
+
+    const timestamp = new Date().toISOString();
+    const firestoreDB = await getFirebaseDB();
+    let firebaseSynced = false;
+
+    if (firestoreDB) {
+      try {
+        await setDoc(doc(firestoreDB, "portfolio_data", key), { data, updatedAt: timestamp });
+        firebaseSynced = true;
+        console.log(`[${key}] persisted to Firestore at ${timestamp}`);
+      } catch (err) {
+        console.error(`Failed to write [${key}] to Firestore:`, err);
+        return res.status(500).json({ error: `Failed to save [${key}] to database` });
+      }
+    } else {
+      console.warn("Firestore unavailable — data will NOT be persisted permanently!");
+    }
+
+    if (!IS_VERCEL) {
+      try {
+        let cached: PortfolioDB;
+        try {
+          const fileExists = await fs.access(DB_FILE).then(() => true).catch(() => false);
+          cached = fileExists ? JSON.parse(await fs.readFile(DB_FILE, "utf-8")) : await initDB();
+        } catch { cached = await initDB(); }
+
+        if (key === "messages") {
+          const newMessages = data || [];
+          const oldMessages = cached.messages || [];
+          if (newMessages.length > oldMessages.length && newMessages.length > 0) {
+            const settings = cached.settings || {};
+            if (settings.enableEmailNotify) {
+              sendEmailNotification(newMessages[0], settings).catch(console.error);
+            }
+          }
+        }
+        cached[key as keyof PortfolioDB] = data;
+        await atomicWriteFile(DB_FILE, JSON.stringify(cached, null, 2));
+      } catch (cacheErr) {
+        console.warn("Local cache update failed (non-critical):", cacheErr);
+      }
+    }
+
+    res.json({ success: true, firebaseSynced });
+  } catch (error) {
+    console.error("Failed to update portfolio data:", error);
+    res.status(500).json({ error: "Failed to update portfolio data" });
+  }
+});
+
+// 3. Reset entire database to defaults
+app.post("/api/portfolio/reset", async (req: express.Request, res: express.Response) => {
+  try {
+    const defaultDB: PortfolioDB = {
+      projects: INITIAL_PROJECTS, skills: INITIAL_SKILLS, experiences: INITIAL_EXPERIENCES,
+      educations: INITIAL_EDUCATIONS, messages: INITIAL_MESSAGES, settings: INITIAL_SETTINGS,
+      certificates: INITIAL_CERTIFICATES
+    };
+    const db = await getFirebaseDB();
+    if (db) {
+      await Promise.all(
+        Object.entries(defaultDB).map(([key, val]) =>
+          setDoc(doc(db, "portfolio_data", key), { data: val, updatedAt: new Date().toISOString() }).catch(err =>
+            console.error(`Failed to reset [${key}] in Firestore:`, err)
+          )
+        )
+      );
+    }
+    await atomicWriteFile(DB_FILE, JSON.stringify(defaultDB, null, 2));
+    res.json({ success: true, db: defaultDB });
+  } catch (error) {
+    console.error("Failed to reset portfolio database:", error);
+    res.status(500).json({ error: "Failed to reset portfolio database" });
+  }
+});
+
+// Production / Vercel: serve built static assets + SPA fallback
+if (IS_VERCEL || process.env.NODE_ENV === "production") {
+  const distPath = path.join(process.cwd(), "dist");
+  app.use(express.static(distPath, { index: false }));
+  app.get("*", async (req: express.Request, res: express.Response) => {
+    await serveHTMLWithInjectedDB(req, res);
   });
 }
 
-startServer();
+// ============================================================
+// Export app as default — required for Vercel serverless handler
+// ============================================================
+export default app;
+
+// ============================================================
+// Local Dev Only — start Vite dev server + Express listener
+// ============================================================
+if (!IS_VERCEL) {
+  (async function startDevServer() {
+    if (process.env.NODE_ENV !== "production") {
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: "spa",
+      });
+      app.get("/", async (req: express.Request, res: express.Response) => {
+        await serveHTMLWithInjectedDB(req, res, vite);
+      });
+      app.get("/index.html", async (req: express.Request, res: express.Response) => {
+        await serveHTMLWithInjectedDB(req, res, vite);
+      });
+      app.use(vite.middlewares);
+    }
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`Server running at http://localhost:${PORT}`);
+    });
+  })();
+}
+
+
 
 async function sendEmailNotification(message: any, settings: any) {
   const smtpHost = settings.smtpHost;
