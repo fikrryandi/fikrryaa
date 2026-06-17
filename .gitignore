@@ -6,3 +6,10 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Local database cache files — DO NOT deploy to Vercel (disk is ephemeral/read-only)
+# All persistent data lives in Firestore, not these local files.
+portfolio_db.json
+portfolio_db.json.*
+local_timestamps.json
+tmp_json/

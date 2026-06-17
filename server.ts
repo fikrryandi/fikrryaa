@@ -19,43 +19,22 @@ import {
 
 const PORT = 3000;
 const DB_FILE = path.join(process.cwd(), "portfolio_db.json");
-const TIMESTAMPS_FILE = path.join(process.cwd(), "local_timestamps.json");
 
-async function getLocalTimestamp(key: string): Promise<string | null> {
-  try {
-    const exists = await fs.access(TIMESTAMPS_FILE).then(() => true).catch(() => false);
-    if (exists) {
-      const content = await fs.readFile(TIMESTAMPS_FILE, "utf-8");
-      const data = JSON.parse(content);
-      return data[key] || null;
-    }
-  } catch (e) {
-    console.error("Failed to read local timestamps:", e);
-  }
-  return null;
-}
+// Detect if running on Vercel (ephemeral file system — never write local files)
+const IS_VERCEL = !!(process.env.VERCEL || process.env.VERCEL_ENV || process.env.VERCEL_URL);
 
-// Helper for atomic file writes to prevent race conditions during hot-reloads
+// Helper for atomic file writes to prevent race conditions during hot-reloads.
+// Only used in local development — Vercel has a read-only/ephemeral file system.
 async function atomicWriteFile(filePath: string, data: string): Promise<void> {
-  const tmpDir = path.join(process.cwd(), "tmp_json");
-  await fs.mkdir(tmpDir, { recursive: true }).catch(() => {});
-  const tmpPath = path.join(tmpDir, path.basename(filePath) + ".tmp." + Date.now());
-  await fs.writeFile(tmpPath, data, "utf-8");
-  await fs.rename(tmpPath, filePath);
-}
-
-async function setLocalTimestamp(key: string, timestamp: string): Promise<void> {
+  if (IS_VERCEL) return; // Skip all file writes on Vercel
   try {
-    let data: any = {};
-    const exists = await fs.access(TIMESTAMPS_FILE).then(() => true).catch(() => false);
-    if (exists) {
-      const content = await fs.readFile(TIMESTAMPS_FILE, "utf-8");
-      data = JSON.parse(content);
-    }
-    data[key] = timestamp;
-    await atomicWriteFile(TIMESTAMPS_FILE, JSON.stringify(data, null, 2));
+    const tmpDir = path.join(process.cwd(), "tmp_json");
+    await fs.mkdir(tmpDir, { recursive: true }).catch(() => {});
+    const tmpPath = path.join(tmpDir, path.basename(filePath) + ".tmp." + Date.now());
+    await fs.writeFile(tmpPath, data, "utf-8");
+    await fs.rename(tmpPath, filePath);
   } catch (e) {
-    console.error("Failed to write local timestamp:", e);
+    console.warn("atomicWriteFile skipped (non-critical in production):", e);
   }
 }
 
@@ -102,21 +81,8 @@ async function getFirebaseDB() {
   }
 }
 
-// Helper to get local data fallback (preferring current portfolio_db.json edits, then INITIAL_* constants)
-async function getLocalFallback(key: string): Promise<any> {
-  try {
-    const fileExists = await fs.access(DB_FILE).then(() => true).catch(() => false);
-    if (fileExists) {
-      const content = await fs.readFile(DB_FILE, "utf-8");
-      const localDB = JSON.parse(content);
-      if (localDB && localDB[key] !== undefined) {
-        return localDB[key];
-      }
-    }
-  } catch (e) {
-    console.error(`Failed to read local fallback for [${key}]:`, e);
-  }
-  
+// Default fallback values if Firestore is completely unavailable
+function getDefaultFallback(key: string): any {
   switch (key) {
     case "projects": return INITIAL_PROJECTS;
     case "skills": return INITIAL_SKILLS;
@@ -129,7 +95,26 @@ async function getLocalFallback(key: string): Promise<any> {
   }
 }
 
-// Try loading full portfolio from Firestore with a robust connection safeguard
+// In local dev only: also try reading from portfolio_db.json as an additional local fallback
+async function getDevLocalFallback(key: string): Promise<any> {
+  if (IS_VERCEL) return getDefaultFallback(key);
+  try {
+    const fileExists = await fs.access(DB_FILE).then(() => true).catch(() => false);
+    if (fileExists) {
+      const content = await fs.readFile(DB_FILE, "utf-8");
+      const localDB = JSON.parse(content);
+      if (localDB && localDB[key] !== undefined) {
+        return localDB[key];
+      }
+    }
+  } catch (e) {
+    console.error(`Failed to read local dev fallback for [${key}]:`, e);
+  }
+  return getDefaultFallback(key);
+}
+
+// Load full portfolio from Firestore — Firestore is the SINGLE SOURCE OF TRUTH.
+// No local timestamp comparison: whatever is in Firestore is always authoritative.
 async function loadPortfolioFromFirestore(): Promise<{ portfolio: PortfolioDB | null; hasErrors: boolean }> {
   const db = await getFirebaseDB();
   if (!db) return { portfolio: null, hasErrors: true };
@@ -144,31 +129,16 @@ async function loadPortfolioFromFirestore(): Promise<{ portfolio: PortfolioDB | 
       try {
         const docRef = doc(db, "portfolio_data", key);
         const docSnap = await getDoc(docRef);
-        const localTimeStr = await getLocalTimestamp(key);
         
         if (docSnap.exists()) {
           anyLoaded = true;
           const cloudDoc = docSnap.data();
-          const cloudTimeStr = cloudDoc.updatedAt;
-          
-          if (localTimeStr && cloudTimeStr) {
-            const localTime = new Date(localTimeStr).getTime();
-            const cloudTime = new Date(cloudTimeStr).getTime();
-            if (localTime > cloudTime) {
-              console.log(`Local timestamp for [${key}] is newer than cloud. Preferring local file data.`);
-              const localData = await getLocalFallback(key);
-              return { key, data: localData, ok: true };
-            }
-          }
-          
+          // Always use Firestore data — no local timestamp comparison!
           return { key, data: cloudDoc.data, ok: true };
         }
         
-        const localData = await getLocalFallback(key);
-        if (localData !== null && localData !== undefined) {
-          anyLoaded = true;
-        }
-        return { key, data: localData, ok: true };
+        // Document doesn't exist yet in Firestore → use defaults
+        return { key, data: null, ok: true };
       } catch (err) {
         console.error(`Error loading segment [${key}] from Firestore:`, err);
         hasErrors = true;
@@ -182,141 +152,80 @@ async function loadPortfolioFromFirestore(): Promise<{ portfolio: PortfolioDB | 
   }
   
   if (!anyLoaded) {
-    return { portfolio: null, hasErrors: false }; // Genuinely blank cloud database
+    return { portfolio: null, hasErrors: false }; // Genuinely blank cloud database — will be seeded
   }
   
   for (const res of results) {
-    if (res.data !== null) {
-      portfolio[res.key as keyof PortfolioDB] = res.data;
-    } else {
-      portfolio[res.key as keyof PortfolioDB] = await getLocalFallback(res.key);
-    }
+    portfolio[res.key as keyof PortfolioDB] = res.data !== null ? res.data : getDefaultFallback(res.key);
   }
   
   return { portfolio: portfolio as PortfolioDB, hasErrors: false };
 }
 
-// Ensure the portfolio state is loaded from Firestore or migrated
+// Load portfolio from Firestore (single source of truth) or fall back to defaults.
+// On Vercel: never reads/writes local files (ephemeral disk).
+// In local dev: also writes to portfolio_db.json for optional offline caching.
 async function initDB(): Promise<PortfolioDB> {
   try {
-    // 1. Try loading from persistent Firestore
+    // 1. Try loading from persistent Firestore (ALWAYS preferred)
     const { portfolio: cloudDB, hasErrors } = await loadPortfolioFromFirestore();
     
     if (hasErrors) {
-      console.warn("Firestore collection connection failed or threw error. Using local cached database as read-only safeguard.");
-      // Load local state but DO NOT write anything back to Firestore in this cycle to protect existing data from deletion/reset
-      const localDB: PortfolioDB = {
-        projects: await getLocalFallback("projects"),
-        skills: await getLocalFallback("skills"),
-        experiences: await getLocalFallback("experiences"),
-        educations: await getLocalFallback("educations"),
-        messages: await getLocalFallback("messages"),
-        settings: await getLocalFallback("settings"),
-        certificates: await getLocalFallback("certificates")
+      // Firestore is unreachable — use safe defaults
+      // On Vercel: use INITIAL_* constants directly (no local file)
+      // In local dev: also try portfolio_db.json for richer fallback
+      console.warn("Firestore unreachable. Using safe fallback data (NO writes to protect Firestore).");
+      return {
+        projects: await getDevLocalFallback("projects"),
+        skills: await getDevLocalFallback("skills"),
+        experiences: await getDevLocalFallback("experiences"),
+        educations: await getDevLocalFallback("educations"),
+        messages: await getDevLocalFallback("messages"),
+        settings: await getDevLocalFallback("settings"),
+        certificates: await getDevLocalFallback("certificates")
       };
-      return localDB;
     }
 
     if (cloudDB) {
-      let needFirestoreSync = false;
-      
-      // Auto-insert edu-4 if missing
-      if (!cloudDB.educations || !cloudDB.educations.some(e => e.id === "edu-4")) {
-        cloudDB.educations = [
-          ...(cloudDB.educations || []),
-          {
-            id: 'edu-4',
-            stage: 'Sarjana (S1) Teknik Industri',
-            stageEN: "Bachelor's Degree in Industrial Engineering",
-            school: 'Sekolah Tinggi Teknologi Wastukancana',
-            schoolEN: 'Wastukancana School of Technology Purwakarta',
-            years: '2022-2026'
-          }
-        ];
-        needFirestoreSync = true;
-      }
-      
-      // Auto-update experiences if outdated
-      if (cloudDB.experiences) {
-        const exp1 = cloudDB.experiences.find(e => e.id === "e1");
-        if (exp1 && exp1.title !== "Magang di Department PPIC Delivery") {
-          exp1.title = "Magang di Department PPIC Delivery";
-          exp1.company = "PT Velasto Indonesia";
-          exp1.years = "Jun 2025 - Jan 2026";
-          exp1.tags = ["PPIC", "Delivery", "Logistik", "Ekspor"];
-          exp1.description = "Mengelola perencanaan dan pengiriman produk agar tepat waktu sesuai jadwal ekspor. Berperan dalam koordinasi antara produksi, gudang, dan logistik untuk memastikan kelancaran distribusi.";
-          needFirestoreSync = true;
-        }
-        
-        const exp2 = cloudDB.experiences.find(e => e.id === "e2");
-        if (exp2 && exp2.title !== "Magang di Department Komite") {
-          exp2.title = "Magang di Department Komite";
-          exp2.company = "PT Velasto Indonesia";
-          exp2.years = "Feb 2026 - Aug 2026";
-          exp2.tags = ["Komite", "Koordinasi Event", "Quality Control", "QCC/QCP"];
-          exp2.description = "Mendukung pelaksanaan program dan kegiatan internal perusahaan, termasuk koordinasi event, peningkatan kualitas kerja (QCC/QCP), serta pengembangan budaya kerja yang efektif dan kolaboratif.";
-          needFirestoreSync = true;
-        }
-      }
-      
-      if (needFirestoreSync) {
-        const db = await getFirebaseDB();
-        if (db) {
-          try {
-            await setDoc(doc(db, "portfolio_data", "educations"), {
-              data: cloudDB.educations,
-              updatedAt: new Date().toISOString()
-            });
-            await setDoc(doc(db, "portfolio_data", "experiences"), {
-              data: cloudDB.experiences,
-              updatedAt: new Date().toISOString()
-            });
-            console.log("Successfully back-synchronized updated educations and experiences to Firestore.");
-          } catch (err) {
-            console.error("Failed to back-sync to Firestore during initialization:", err);
-          }
-        }
-      }
-
-      // Synchronize back to local file cache
+      // Optionally cache to local file in dev mode only (never on Vercel)
       await atomicWriteFile(DB_FILE, JSON.stringify(cloudDB, null, 2));
       return cloudDB;
     }
     
-    // 2. Migration: Firestore is blank. Let's load local edit state (or default constants)
-    console.log("Firestore database is empty. Migrating local file data or default configurations to Cloud Firestore...");
-    const localDB: PortfolioDB = {
-      projects: await getLocalFallback("projects"),
-      skills: await getLocalFallback("skills"),
-      experiences: await getLocalFallback("experiences"),
-      educations: await getLocalFallback("educations"),
-      messages: await getLocalFallback("messages"),
-      settings: await getLocalFallback("settings"),
-      certificates: await getLocalFallback("certificates")
+    // 2. Firestore is blank — seed it with defaults then return
+    console.log("Firestore is empty. Seeding with default portfolio data...");
+    const defaultDB: PortfolioDB = {
+      projects: INITIAL_PROJECTS,
+      skills: INITIAL_SKILLS,
+      experiences: INITIAL_EXPERIENCES,
+      educations: INITIAL_EDUCATIONS,
+      messages: INITIAL_MESSAGES,
+      settings: INITIAL_SETTINGS,
+      certificates: INITIAL_CERTIFICATES
     };
     
-    // 3. Persist migrated data into cloud Firestore
-    const db = await getFirebaseDB();
-    if (db) {
+    // Persist seed data to Firestore so future requests have data
+    const firestoreDB = await getFirebaseDB();
+    if (firestoreDB) {
       await Promise.all(
-        Object.entries(localDB).map(async ([key, val]) => {
+        Object.entries(defaultDB).map(async ([key, val]) => {
           try {
-            await setDoc(doc(db, "portfolio_data", key), {
+            await setDoc(doc(firestoreDB, "portfolio_data", key), {
               data: val,
               updatedAt: new Date().toISOString()
             });
-            console.log(`Migrated [${key}] segment successfully into Firestore.`);
+            console.log(`Seeded [${key}] into Firestore.`);
           } catch (err) {
-            console.error(`Failed to migrate [${key}] segment to Firestore:`, err);
+            console.error(`Failed to seed [${key}] to Firestore:`, err);
           }
         })
       );
     }
     
-    await atomicWriteFile(DB_FILE, JSON.stringify(localDB, null, 2));
-    return localDB;
+    await atomicWriteFile(DB_FILE, JSON.stringify(defaultDB, null, 2));
+    return defaultDB;
   } catch (error) {
-    console.error("Error initializing database, using defaults:", error);
+    console.error("initDB fatal error, using hardcoded defaults:", error);
     return {
       projects: INITIAL_PROJECTS,
       skills: INITIAL_SKILLS,
@@ -361,50 +270,66 @@ async function startServer() {
 
       const timestamp = new Date().toISOString();
 
-      // Update in cloud Firestore (with safe fallback to local cache on error)
-      const db = await getFirebaseDB();
+      // Save to Firestore — this is the ONLY persistent storage (especially on Vercel)
+      const firestoreDB = await getFirebaseDB();
       let firebaseSynced = false;
-      if (db) {
+      if (firestoreDB) {
         try {
-          await setDoc(doc(db, "portfolio_data", key), {
+          await setDoc(doc(firestoreDB, "portfolio_data", key), {
             data: data,
             updatedAt: timestamp
           });
           firebaseSynced = true;
-          console.log(`Successfully persisted [${key}] segment in Firestore.`);
+          console.log(`[${key}] persisted to Firestore at ${timestamp}`);
         } catch (err) {
-          console.error(`Failed to write [${key}] to Firestore (falling back to local file):`, err);
+          console.error(`Failed to write [${key}] to Firestore:`, err);
+          // Return error so the client knows the save failed
+          return res.status(500).json({ error: `Failed to save [${key}] to database` });
         }
+      } else {
+        console.warn("Firestore unavailable — data will NOT be persisted permanently!");
       }
 
-      // Always write local timestamp to ensure local edits can be compared
-      await setLocalTimestamp(key, timestamp);
-
-      // Sync local file cache (ensures changes are always saved!)
-      const cached = await initDB();
-
-      // If we are updating messages, check if a new message was added!
-      if (key === "messages") {
-        const oldMessages = cached.messages || [];
-        const newMessages = data || [];
-        
-        if (newMessages.length > oldMessages.length && newMessages.length > 0) {
-          const newMsg = newMessages[0]; // new messages are inserted at the head
-          const settings = cached.settings || {};
-          
-          if (settings.enableEmailNotify) {
-            console.log(`Dispatched automatic background SMTP notification for message from ${newMsg.sender}`);
-            sendEmailNotification(newMsg, settings).catch(err => {
-              console.error("Failed to dispatch background email notification:", err);
-            });
+      // In local dev: also update the local JSON cache for offline use
+      if (!IS_VERCEL) {
+        try {
+          let cached: PortfolioDB;
+          try {
+            const fileExists = await fs.access(DB_FILE).then(() => true).catch(() => false);
+            if (fileExists) {
+              const content = await fs.readFile(DB_FILE, "utf-8");
+              cached = JSON.parse(content);
+            } else {
+              cached = await initDB();
+            }
+          } catch {
+            cached = await initDB();
           }
+
+          // Email notification for new messages (local dev only)
+          if (key === "messages") {
+            const oldMessages = cached.messages || [];
+            const newMessages = data || [];
+            if (newMessages.length > oldMessages.length && newMessages.length > 0) {
+              const newMsg = newMessages[0];
+              const settings = cached.settings || {};
+              if (settings.enableEmailNotify) {
+                console.log(`Dispatched SMTP notification for message from ${newMsg.sender}`);
+                sendEmailNotification(newMsg, settings).catch(err => {
+                  console.error("Failed to dispatch email notification:", err);
+                });
+              }
+            }
+          }
+
+          cached[key as keyof PortfolioDB] = data;
+          await atomicWriteFile(DB_FILE, JSON.stringify(cached, null, 2));
+        } catch (cacheErr) {
+          console.warn("Local cache update failed (non-critical):", cacheErr);
         }
       }
 
-      cached[key as keyof PortfolioDB] = data;
-      await atomicWriteFile(DB_FILE, JSON.stringify(cached, null, 2));
-
-      console.log(`Database key [${key}] successfully updated on server. Firebase synced: ${firebaseSynced}`);
+      console.log(`[${key}] update complete. Firestore synced: ${firebaseSynced}`);
       res.json({ success: true, firebaseSynced });
     } catch (error) {
       console.error("Failed to update portfolio data:", error);
@@ -442,9 +367,6 @@ async function startServer() {
         );
         console.log("Firestore database successfully reset back to defaults.");
       }
-
-      // Clear local timestamps
-      await fs.unlink(TIMESTAMPS_FILE).catch(() => {});
 
       await atomicWriteFile(DB_FILE, JSON.stringify(defaultDB, null, 2));
       console.log("Database reset to defaults.");
